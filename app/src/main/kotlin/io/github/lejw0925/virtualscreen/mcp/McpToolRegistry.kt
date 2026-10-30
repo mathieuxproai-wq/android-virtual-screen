@@ -245,39 +245,43 @@ class McpToolRegistry(private val sessions: VirtualScreenSessionManager,
             else result.copy(values=result.values+mapOf("requires_observation" to true))
         }
         val started=System.nanoTime()/1000000
-        // Poll cheap trees until the structure stops changing, then capture the requested payload once.
-        var current=collect(owner,token,if(mode=="screenshot") "tree" else mode)
         var settled=false
-        if(waitMode=="stable" && current.envelope.ok) {
-            var signature=SettleSignature.of(current.snapshot?.nodes.orEmpty())
-            var stable=0
-            val deadline=started+waitMs.coerceAtLeast(0)
-            while(stable<3) {
-                if(System.nanoTime()/1000000>=deadline) break
-                delay(50)
-                val next=try { collect(owner,token,"tree") }
-                    catch(c: CancellationException) { throw c }
-                    catch(e: Exception) { break }
-                val nextSignature=SettleSignature.of(next.snapshot?.nodes.orEmpty())
-                if(nextSignature.isNotEmpty() && nextSignature==signature) stable++ else { stable=0; signature=nextSignature }
-                current=next
+        var collected: Collected?=null
+        var failureCode: String?=null
+        try {
+            if(waitMode=="stable") {
+                // Poll cheap trees until the structure stops changing, then capture the requested payload once.
+                var current=collect(owner,token,if(mode=="screenshot") "tree" else mode)
+                var signature=SettleSignature.of(current.snapshot?.nodes.orEmpty())
+                var stable=0
+                val deadline=started+waitMs.coerceAtLeast(0)
+                while(stable<3) {
+                    if(System.nanoTime()/1000000>=deadline) break
+                    delay(50)
+                    val next=collect(owner,token,"tree")
+                    val nextSignature=SettleSignature.of(next.snapshot?.nodes.orEmpty())
+                    if(nextSignature.isNotEmpty() && nextSignature==signature) stable++ else { stable=0; signature=nextSignature }
+                    current=next
+                }
+                settled=stable>=3
+                collected=if(mode=="tree") current else collect(owner,token,mode)
+            } else {
+                if(waitMode=="delay" && waitMs>0) delay(waitMs.toLong())
+                collected=collect(owner,token,mode)
             }
-            settled=stable>=3
-        } else if(waitMode=="delay" && waitMs>0) {
-            delay(waitMs.toLong())
-        }
-        val final=if(mode=="tree") current else collect(owner,token,mode)
-        val next=final.envelope
+        } catch(c: CancellationException) { throw c }
+        catch(e: Exception) { failureCode=e.code() }
+        val next=collected?.envelope
         val timing=mapOf("settled" to settled,"wait_mode" to waitMode,
             "waited_ms" to (System.nanoTime()/1000000-started).coerceAtLeast(0))
         // Never replay an accepted input if the subsequent observation fails.
-        return try {
-            if (next.ok) result.copy(values=result.values+next.values+timing+mapOf("observation_status" to "available","requires_observation" to false))
-            else result.copy(values=result.values+next.values+timing+mapOf("observation_status" to "failed",
-                "observation_error" to next.code, "observation_message" to localizedError(language(), next.code ?: "BACKEND_OPERATION_FAILED"),
+        return if(next!=null && next.ok) result.copy(values=result.values+next.values+timing+mapOf("observation_status" to "available","requires_observation" to false))
+        else {
+            val code=next?.code ?: failureCode ?: "BACKEND_OPERATION_FAILED"
+            result.copy(values=result.values+(next?.values ?: emptyMap())+timing+mapOf("observation_status" to "failed",
+                "observation_error" to code, "observation_message" to localizedError(language(), code),
                 "requires_observation" to true))
-        } catch(c: CancellationException) { throw c }
-          catch(e: Exception) { result.copy(values=result.values+timing+mapOf("observation_status" to "failed","observation_error" to e.code(),"requires_observation" to true)) }
+        }
     }
     private fun matches(n: NodeInfo,s: JSONObject): Boolean = n.visible &&
         (!s.has("resource_id") || n.resourceId==s.getString("resource_id")) &&
